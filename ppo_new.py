@@ -1,10 +1,9 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
 import os
 import random
 import time
 from dataclasses import dataclass
 
-import gymnasium as gym
+import gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,14 +23,6 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
-    wandb_entity: str = None
-    """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
@@ -40,9 +31,11 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 4
+    # num_envs: int = 4
+    num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 128
+    # num_steps: int = 128
+    num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -68,7 +61,6 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
-
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -77,42 +69,27 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        return env
-
-    return thunk
-
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.observation_space.shape[0]).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.observation_space.shape[0]).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            layer_init(nn.Linear(64, envs.action_space.n), std=0.01),
         )
 
     def get_value(self, x):
@@ -125,32 +102,19 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
-
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
+    args.batch_size = int(args.num_envs * args.num_steps) # 1 * 512
+    args.minibatch_size = int(args.batch_size // args.num_minibatches) # 512 // 4 = 128
+    args.num_iterations = args.total_timesteps // args.batch_size # 500000 // 512 = 976
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
 
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -158,63 +122,70 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
-    )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    envs = gym.make(args.env_id)
+    assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs = torch.zeros((args.num_steps, envs.observation_space.shape[0])).to(device)
+    actions = torch.zeros((args.num_steps, )).to(device)
+    logprobs = torch.zeros((args.num_steps, )).to(device)
+    rewards = torch.zeros((args.num_steps, )).to(device)
+    dones = torch.zeros((args.num_steps, )).to(device)
+    values = torch.zeros((args.num_steps, )).to(device)
 
-    # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    for iteration in range(1, args.num_iterations + 1):
+    episodic_return = 0
+    episodic_length = 0
+
+    for iteration in range(1, args.num_iterations + 1): # iteration 从1 到 976
+        print('**************************************************')
+        print('第 {} of 976 轮'.format(iteration))
+        print('**************************************************')
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
+            # anneal_lr 是 Learning Rate Annealing 学习率退火
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # 执行512个step
         for step in range(0, args.num_steps):
-            global_step += args.num_envs
+            global_step += 1
             obs[step] = next_obs
             dones[step] = next_done
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminations, truncations)
+            next_obs, reward, done, info = envs.step(action.cpu().numpy())
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(np.array(done)).to(device)
+            episodic_return += reward
+            episodic_length += 1
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            if done == True:
+                # 计算回合的奖励和长度
+                envs.reset()
+                print(f"global_step={global_step}, episodic_return={episodic_return}")
+                writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+                episodic_return = 0
+                episodic_length = 0
+        print('--------------------------------------------------')
+        print('第 {} of 976 轮 采样完毕数据'.format(iteration))
+        print('--------------------------------------------------')
 
-        # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -231,22 +202,28 @@ if __name__ == "__main__":
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = obs.reshape((-1,) + envs.observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = actions.reshape((-1,) + envs.action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        b_inds = np.arange(args.batch_size)  # batch_size = 512   b_inds = [0,1,2....,511]
+        # 用于存储每个批次的clip fraction值
         clipfracs = []
-        for epoch in range(args.update_epochs):
+        for epoch in range(args.update_epochs): # update_epochs = 4
+            # 随机打乱b_inds数组中的元素顺序，以便每个epoch中随机选择训练样本。
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            # 将训练样本划分为多个大小为args.minibatch_size = 128的小批次
+            # 其中start和end是小批次的起始索引和结束索引
+            # mb_inds是当前小批次中样本的索引。
+            for start in range(0, args.batch_size, args.minibatch_size): # minibatch_size = 128
+                # start = 0, 128, 256, 384
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
+                # 根据输入的观察和动作，获取新的对数概率（newlogprob），策略熵（entropy）和值函数估计值（newvalue）
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -296,7 +273,6 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)

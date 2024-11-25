@@ -4,7 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 
-import gymnasium as gym
+import gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -44,13 +44,13 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"
     """the id of the environment"""
-    total_timesteps: int = 10000000
+    total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 8
+    num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -86,27 +86,31 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
-        return env
+# def make_env(env_id, capture_video, run_name):
+#     def thunk():
+#         if capture_video:
+#             env = gym.make(env_id, render_mode="rgb_array")
+#             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+#         else:
+#             env = gym.make(env_id)
+#         env = gym.wrappers.RecordEpisodeStatistics(env)
+#         env = NoopResetEnv(env, noop_max=30)
+#         env = MaxAndSkipEnv(env, skip=4)
+#         env = EpisodicLifeEnv(env)
+#         if "FIRE" in env.unwrapped.get_action_meanings():
+#             env = FireResetEnv(env)
+#         env = ClipRewardEnv(env)
+#         env = gym.wrappers.ResizeObservation(env, (84, 84))
+#         env = gym.wrappers.GrayScaleObservation(env)
+#         env = gym.wrappers.FrameStack(env, 4)
+#         return env
+#
+#     return thunk
 
-    return thunk
 
+# 图像预处理需要
+# 输入网络的图像需要是灰度的84*84然后堆叠四张的
+# 所以输入的应该是4*84*84的灰度图
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -128,7 +132,7 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
-        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
+        self.actor = layer_init(nn.Linear(512, envs.action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(512, 1), std=1)
 
     def get_value(self, x):
@@ -145,22 +149,22 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
+    args.batch_size = int(args.num_envs * args.num_steps) # 1 * 512
+    args.minibatch_size = int(args.batch_size // args.num_minibatches) # 512 // 4 = 128
+    args.num_iterations = args.total_timesteps // args.batch_size # 500000 // 512 = 976
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
+    # if args.track:
+    #     import wandb
+    #
+    #     wandb.init(
+    #         project=args.wandb_project_name,
+    #         entity=args.wandb_entity,
+    #         sync_tensorboard=True,
+    #         config=vars(args),
+    #         name=run_name,
+    #         monitor_gym=True,
+    #         save_code=True,
+    #     )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -176,38 +180,49 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
-    )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    # envs = gym.vector.SyncVectorEnv(
+    #     [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+    # )
+    # assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
+    envs = gym.make(args.env_id)
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs = torch.zeros((args.num_steps, ) + envs.observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, )).to(device)
+    logprobs = torch.zeros((args.num_steps, )).to(device)
+    rewards = torch.zeros((args.num_steps, )).to(device)
+    dones = torch.zeros((args.num_steps, )).to(device)
+    values = torch.zeros((args.num_steps, )).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    for iteration in range(1, args.num_iterations + 1):
+    episodic_return = 0
+    episodic_length = 0
+
+    for iteration in range(1, args.num_iterations + 1): # iteration 从1 到 976
+        print('**************************************************')
+        print('第 {} of 976 轮'.format(iteration))
+        print('**************************************************')
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
+            # anneal_lr 是 Learning Rate Annealing 学习率退火
+            # 学习率退火是一种训练过程中动态调整学习率的技术。它通常会在训练的早期使用较大的学习率以加快收敛速度，
+            # 然后逐渐降低学习率，让模型在训练后期更加稳定地收敛或探索更细致的参数空间。
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # 执行512个step
         for step in range(0, args.num_steps):
-            global_step += args.num_envs
+            global_step += 1
             obs[step] = next_obs
             dones[step] = next_done
 
@@ -219,17 +234,28 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminations, truncations)
+            next_obs, reward, done, info = envs.step(action.cpu().numpy())
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
-
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(np.array(done)).to(device)
+            episodic_return += reward
+            episodic_length += 1
+            # if "final_info" in infos:
+            #     for info in infos["final_info"]:
+            #         if info and "episode" in info:
+            #             print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+            #             writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+            #             writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            if done == True:
+                # 计算回合的奖励和长度
+                envs.reset()
+                print(f"global_step={global_step}, episodic_return={episodic_return}")
+                writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+                episodic_return = 0
+                episodic_length = 0
+        print('--------------------------------------------------')
+        print('第 {} of 976 轮 采样完毕数据'.format(iteration))
+        print('--------------------------------------------------')
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -248,26 +274,41 @@ if __name__ == "__main__":
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = obs.reshape((-1,) + envs.observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = actions.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        b_inds = np.arange(args.batch_size) # batch_size = 512   b_inds = [0,1,2....,511]
+        # 用于存储每个批次的clip fraction值
         clipfracs = []
-        for epoch in range(args.update_epochs):
+        for epoch in range(args.update_epochs): # update_epochs = 4
+            # 随机打乱b_inds数组中的元素顺序，以便每个epoch中随机选择训练样本。
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            # 将训练样本划分为多个大小为args.minibatch_size = 128的小批次
+            # 其中start和end是小批次的起始索引和结束索引
+            # mb_inds是当前小批次中样本的索引。
+            for start in range(0, args.batch_size, args.minibatch_size): # minibatch_size = 128
+                # start = 0, 128, 256, 384
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
+                # 根据输入的观察和动作，获取新的对数概率（newlogprob），策略熵（entropy）和值函数估计值（newvalue）
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
+                # "clip fraction"（裁剪比例）是指在使用PPO算法进行优化时，计算出的近似策略比率在被裁剪范围之外的比例。
+                # 在PPO算法中，为了限制每次更新的策略变化幅度，会使用一个裁剪系数（clip coefficient）
+                # 如果策略比率（新的概率与旧的概率之比）超过了裁剪系数范围之外，那么它就会被裁剪到该范围内
+                # 裁剪后的策略比率被用于计算策略损失
+                # "clip fraction"是指裁剪后的策略比率超过裁剪系数的比例
+                # 它表示了在训练过程中有多少比例的策略比率被裁剪到了裁剪范围内
+                # 通常，我们希望裁剪比例较低，即大部分策略比率都处于裁剪范围内
+                # 较低的裁剪比例表明策略更新的幅度较小，收敛性更好。因此，观察和监控裁剪比例可以帮助我们了解模型训练的稳定性和效果
+                # 计算旧的近似KL散度（old_approx_kl）和新的近似KL散度（approx_kl）
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()

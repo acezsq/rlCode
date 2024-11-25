@@ -3,24 +3,23 @@ import os
 import random
 import time
 from dataclasses import dataclass
-
-import gymnasium as gym
+import gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from stable_baselines3.common.atari_wrappers import (
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
+# from stable_baselines3.common.atari_wrappers import (
+#     ClipRewardEnv,
+#     EpisodicLifeEnv,
+#     FireResetEnv,
+#     MaxAndSkipEnv,
+#     NoopResetEnv,
+# )
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
-
+from collections import namedtuple
 
 @dataclass
 class Args:
@@ -77,32 +76,6 @@ class Args:
     train_frequency: int = 4
     """the frequency of training"""
 
-
-def make_env(env_id, seed, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
-
-        env.action_space.seed(seed)
-        return env
-
-    return thunk
-
-
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
     def __init__(self, env):
@@ -128,32 +101,49 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
+# 定义 Sample 数据结构
+Sample = namedtuple("Sample", ["observations", "next_observations", "actions", "rewards", "dones"])
+
+class ReplayBuffer:
+    def __init__(self, buffer_size, observation_space, action_space):
+        self.buffer_size = buffer_size
+        self.obs_buf = np.zeros((buffer_size, *observation_space.shape), dtype=np.float32)
+        self.next_obs_buf = np.zeros((buffer_size, *observation_space.shape), dtype=np.float32)
+        self.actions_buf = np.zeros((buffer_size, *action_space.shape), dtype=np.int64)
+        self.rewards_buf = np.zeros(buffer_size, dtype=np.float32)
+        self.dones_buf = np.zeros(buffer_size, dtype=np.float32)
+        self.ptr = 0
+        self.size = 0
+
+    def add(self, obs, next_obs, action, reward, done):
+        self.obs_buf[self.ptr] = obs
+        self.next_obs_buf[self.ptr] = next_obs
+        self.actions_buf[self.ptr] = action
+        self.rewards_buf[self.ptr] = reward
+        self.dones_buf[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.buffer_size
+        self.size = min(self.size + 1, self.buffer_size)
+
+    def sample(self, batch_size):
+        indices = np.random.choice(self.size, batch_size, replace=False)
+        return Sample(
+            observations=torch.tensor(self.obs_buf[indices], dtype=torch.float32),
+            next_observations=torch.tensor(self.next_obs_buf[indices], dtype=torch.float32),
+            actions=torch.tensor(self.actions_buf[indices], dtype=torch.int64),
+            rewards=torch.tensor(self.rewards_buf[indices], dtype=torch.float32),
+            dones=torch.tensor(self.dones_buf[indices], dtype=torch.float32),
+        )
+
+    def __len__(self):
+        return self.size
+
 
 if __name__ == "__main__":
-    import stable_baselines3 as sb3
 
-    if sb3.__version__ < "2.0":
-        raise ValueError(
-            """Ongoing migration: run the following command to install the new dependencies:
-
-poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-license]==0.28.1"  "ale-py==0.8.1" 
-"""
-        )
     args = tyro.cli(Args)
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
 
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -168,11 +158,7 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    envs = gym.make(args.env_id)
 
     q_network = QNetwork(envs).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
@@ -181,59 +167,55 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
 
     rb = ReplayBuffer(
         args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        optimize_memory_usage=True,
-        handle_timeout_termination=False,
+        envs.observation_space,
+        envs.action_space,
     )
+
     start_time = time.time()
 
+    episodic_return = 0
+    episodic_length = 0
+
     # TRY NOT TO MODIFY: start the game
-    obs, _ = envs.reset(seed=args.seed)
+    obs = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
         if random.random() < epsilon:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            actions = envs.action_space.sample()
         else:
-            q_values = q_network(torch.Tensor(obs).to(device))
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+            q_values = q_network(torch.tensor(obs).unsqueeze(0).to(device))
+            actions = torch.argmax(q_values, dim=1).cpu().numpy()[0]
 
-        # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs, reward, done, info = envs.step(actions)
+        episodic_return += reward
+        episodic_length += 1
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
-
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+        rb.add(obs, next_obs, actions, reward, done)
         obs = next_obs
+
+        if done == True:
+            # 计算回合的奖励和长度
+            obs = envs.reset()
+            print(f"global_step={global_step}, episodic_return={episodic_return}")
+            writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+            writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+            episodic_return = 0
+            episodic_length = 0
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
-                    target_max, _ = target_network(data.next_observations).max(dim=1)
-                    td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
-                loss = F.mse_loss(td_target, old_val)
+                    target_max = target_network(data.next_observations).max(dim=1)[0]
+                    td_target = data.rewards + args.gamma * target_max * (1 - data.dones)
+                current_q = q_network(data.observations).gather(1, data.actions.unsqueeze(-1)).squeeze(-1)
+                loss = F.mse_loss(td_target, current_q)
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
-                    writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
+                    writer.add_scalar("losses/q_values", current_q.mean().item(), global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
@@ -249,31 +231,6 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
 
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save(q_network.state_dict(), model_path)
-        print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.dqn_eval import evaluate
-
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=QNetwork,
-            device=device,
-            epsilon=0.05,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "DQN", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()
