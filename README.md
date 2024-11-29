@@ -9,7 +9,7 @@
 | ..... |  |  |  |
 
 
-ppo和dqn普通版本目前已验证经过我的修改之后没有大问题，可以直接用；atari版本也可以跑通，但是需要注意需要将输入的图像堆叠成四个维度batch * channel * height * width（比如将1*4*84*84这种）。
+ppo和dqn普通版本目前已验证经过我的修改之后没有大问题，可以直接用；atari版本也可以跑通，但是需要注意需要将输入的图像堆叠成四个维度batch * channel * height * width（比如将1 * 4 * 84 * 84这种）。
 训练的对比效果图如下：
 
 ![dqn vs dqn_new.png](https://github.com/acezsq/rlCode/blob/main/pic/dqn%20vs%20dqn_new.png)
