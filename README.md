@@ -1,10 +1,19 @@
 ﻿# rlCode
+
+本代码仓库主要是修改cleanrl的rl算法实现以适配自定义gym环境。使用本代码仓库更容易和大家自己定义的gym环境对接。
+修改的主要内容：
+（1）更改cleanrl中多个环境并行采集数据的实现为单环境采集（为了适配我自己的gym任务环境）
+（2）将gymnasium改为的gym（我自己的环境之前是基于gym实现的）
+（3）去除部分我认为暂时没必要的配置项
+（4）增加少量控制台打印训练进度信息展示
+ 
 | rl算法 | cleanrl | my | my代码是否验证 |
 | :---: | :---: | :---: | :---: |
 | ppo | [ppo](https://github.com/acezsq/rlCode/blob/main/ppo.py) | [ppo_new](https://github.com/acezsq/rlCode/blob/main/ppo_new.py) | ✅ |
 | ppo_atari | [ppo_atari](https://github.com/acezsq/rlCode/blob/main/ppo_atari.py) | [ppo_atari_new](https://github.com/acezsq/rlCode/blob/main/ppo_atari_new.py) | ✅ |
 | dqn | [dqn](https://github.com/acezsq/rlCode/blob/main/dqn.py) | [dqn_new](https://github.com/acezsq/rlCode/blob/main/dqn_new.py) | ✅ |
 | dqn_atari | [dqn_atari](https://github.com/acezsq/rlCode/blob/main/dqn_atari.py) | [dqn_atari_new](https://github.com/acezsq/rlCode/blob/main/dqn_atari_new.py) | ✅ |
+| sac_atari | [sac_atari](https://github.com/acezsq/rlCode/blob/main/sac_atari.py) | [sac_atari_new](https://github.com/acezsq/rlCode/blob/main/sac_atari_new.py) | ✅ |
 | ..... |  |  |  |
 | ..... |  |  |  |
 
